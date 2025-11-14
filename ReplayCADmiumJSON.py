@@ -1,5 +1,5 @@
 # Fusion 360: Replay a CADmium / Fusion360-ds JSON row into real geometry
-# Draws circle / ring sketches, extrudes (NewBody/Join), flips on 180° about X,
+# Draws circle / ring / line sketches, extrudes (NewBody/Join), flips 180° about X if needed,
 # and TRANSLATES the body by tz instead of creating an offset construction plane.
 
 import adsk.core, adsk.fusion, traceback, json, math
@@ -10,38 +10,54 @@ import adsk.core, adsk.fusion, traceback, json, math
 UNIT_MULT = 100
 # -------------------------------------
 
+
 def _get_ui_app_handlers():
     app = adsk.core.Application.get()
     ui  = app.userInterface
     return app, ui
 
+
 def _map_operation(op_str):
     ops = adsk.fusion.FeatureOperations
     m = {
-        'NewBodyFeatureOperation': ops.NewBodyFeatureOperation,
-        'JoinFeatureOperation':    ops.JoinFeatureOperation,
-        'CutFeatureOperation':     ops.CutFeatureOperation,
-        'IntersectFeatureOperation': ops.IntersectFeatureOperation
+        'NewBodyFeatureOperation':      ops.NewBodyFeatureOperation,
+        'JoinFeatureOperation':         ops.JoinFeatureOperation,
+        'CutFeatureOperation':          ops.CutFeatureOperation,
+        'IntersectFeatureOperation':    ops.IntersectFeatureOperation
     }
     return m.get(op_str, ops.NewBodyFeatureOperation)
 
-def _pick_profile_for_circles(sketch):
+
+def _pick_profile(sketch):
+    """Pick a profile to extrude. Prefer an annulus (2 loops), else first profile."""
     profs = sketch.profiles
     if profs.count == 0:
         return None
-    # Prefer an annulus (2 loops) if present
+
+    # Prefer a 2-loop profile (ring), which matches the original circle behavior
     for i in range(profs.count):
         p = profs.item(i)
         try:
             if p.profileLoops and p.profileLoops.count == 2:
                 return p
         except:
+            # If profileLoops isn't available or something odd happens, just skip
             pass
+
+    # Otherwise, fall back to the first profile
     return profs.item(0)
+
 
 def _add_circle(sketch, cx_cm, cy_cm, r_cm):
     center = adsk.core.Point3D.create(cx_cm, cy_cm, 0)
     sketch.sketchCurves.sketchCircles.addByCenterRadius(center, r_cm)
+
+
+def _add_line(sketch, x1_cm, y1_cm, x2_cm, y2_cm):
+    p1 = adsk.core.Point3D.create(x1_cm, y1_cm, 0)
+    p2 = adsk.core.Point3D.create(x2_cm, y2_cm, 0)
+    sketch.sketchCurves.sketchLines.addByTwoPoints(p1, p2)
+
 
 def _ensure_design():
     app = adsk.core.Application.get()
@@ -51,6 +67,7 @@ def _ensure_design():
         raise RuntimeError("Please switch to the DESIGN workspace and try again.")
     return design
 
+
 def _move_body(root_comp, body, dx_cm, dy_cm, dz_cm):
     move_feats = root_comp.features.moveFeatures
     coll = adsk.core.ObjectCollection.create()
@@ -59,6 +76,7 @@ def _move_body(root_comp, body, dx_cm, dy_cm, dz_cm):
     xf.setToTranslation(adsk.core.Vector3D.create(dx_cm, dy_cm, dz_cm))
     inp = move_feats.createInput(coll, xf)
     move_feats.add(inp)
+
 
 def run(context):
     app, ui = _get_ui_app_handlers()
@@ -94,46 +112,70 @@ def run(context):
             ty_cm = ty * UNIT_MULT
             tz_cm = tz * UNIT_MULT
 
-            # Sketch on XY at z=0
+            # Sketch on XY at z = 0
             sketch = root.sketches.add(xy_plane)
 
-            # Draw circles from JSON (apply sketch_scale + XY translation)
+            # Draw geometry from JSON (apply sketch_scale + XY translation)
             drew_any = False
             sketch_dict = part.get('sketch', {})
             sk_scale = float(part.get('extrusion', {}).get('sketch_scale', 1.0))
 
-            for face_val in sketch_dict.values():
+            # sketch_dict: { "face_1": { "loop_1": { "circle_1"/"line_1": {...}, ... }, ... }, ... }
+            for face_name, face_val in sketch_dict.items():
                 if not isinstance(face_val, dict):
                     continue
-                for loop_val in face_val.items():
-                    # loop_val can be ("loop_1", {...})
-                    if not isinstance(loop_val, tuple) or not isinstance(loop_val[1], dict):
+
+                # face_val: { "loop_1": {...}, "loop_2": {...}, ... }
+                for loop_name, loop_val in face_val.items():
+                    if not isinstance(loop_val, dict):
                         continue
-                    for circ_val in loop_val[1].values():
-                        if not isinstance(circ_val, dict):
+
+                    # loop_val: { "circle_1": {...}, "line_1": {...}, ... }
+                    for prim_name, prim in loop_val.items():
+                        if not isinstance(prim, dict):
                             continue
-                        if 'Center' not in circ_val or 'Radius' not in circ_val:
+
+                        # --- Circles ---
+                        if 'Center' in prim and 'Radius' in prim:
+                            cx, cy = prim['Center']
+                            r = prim['Radius']
+
+                            cx_cm = (tx + sk_scale * cx) * UNIT_MULT
+                            cy_cm = (ty + sk_scale * cy) * UNIT_MULT
+                            r_cm  = (sk_scale * r)       * UNIT_MULT
+
+                            _add_circle(sketch, cx_cm, cy_cm, r_cm)
+                            drew_any = True
+
+                        # --- Lines ---
+                        elif 'Start Point' in prim and 'End Point' in prim:
+                            (x1, y1) = prim['Start Point']
+                            (x2, y2) = prim['End Point']
+
+                            x1_cm = (tx + sk_scale * x1) * UNIT_MULT
+                            y1_cm = (ty + sk_scale * y1) * UNIT_MULT
+                            x2_cm = (tx + sk_scale * x2) * UNIT_MULT
+                            y2_cm = (ty + sk_scale * y2) * UNIT_MULT
+
+                            _add_line(sketch, x1_cm, y1_cm, x2_cm, y2_cm)
+                            drew_any = True
+
+                        # Unknown primitive type -> ignore
+                        else:
                             continue
-                        cx, cy = circ_val['Center']
-                        r = circ_val['Radius']
-                        cx_cm = (tx + sk_scale * cx) * UNIT_MULT
-                        cy_cm = (ty + sk_scale * cy) * UNIT_MULT
-                        r_cm  = (sk_scale * r) * UNIT_MULT
-                        _add_circle(sketch, cx_cm, cy_cm, r_cm)
-                        drew_any = True
 
             if not drew_any:
-                ui.messageBox(f'No circles drawn for {part_name}; check JSON.')
+                ui.messageBox(f'No sketch geometry drawn for {part_name}; check JSON.')
                 continue
 
-            profile = _pick_profile_for_circles(sketch)
+            profile = _pick_profile(sketch)
             if not profile:
                 ui.messageBox(f'No valid profile for {part_name}.')
                 continue
 
             # Extrusion
             ext = part.get('extrusion', {})
-            depth_pos = float(ext.get('extrude_depth_towards_normal', 0.0)) * UNIT_MULT
+            depth_pos = float(ext.get('extrude_depth_towards_normal', 0.0)) * UNIT_MULT *sk_scale
             operation = _map_operation(ext.get('operation', 'NewBodyFeatureOperation'))
 
             # Flip if exactly 180° about X (common in dataset)
@@ -147,15 +189,15 @@ def run(context):
             ext_input.setDistanceExtent(False, dist_input)
             extrude = extrudes.add(ext_input)
 
-            # Name body (best effort)
+            # Name body and translate by tz along +Z after extrusion
             try:
                 if extrude and extrude.bodies and extrude.bodies.count > 0:
                     body = extrude.bodies.item(0)
                     body.name = part_name
-                    # Translate by tz along +Z after extrusion
                     if abs(tz_cm) > 1e-9:
                         _move_body(root, body, 0.0, 0.0, tz_cm)
             except:
+                # Best-effort only; ignore naming/move errors
                 pass
 
         ui.messageBox('Replay complete.')
